@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.log
+.streamlit/secrets.toml
+
+# Generated reports and local build artifacts
+Relatorio_*.docx
+Relatorio_*.pdf
+Relatorios_*.zip
+build/
+dist/
+*.spec
+*.exe
+*.bat
+
+# Local backup/corrupted templates kept outside version control
+template.backup_*.docx
+template.corrompido_*.docx
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

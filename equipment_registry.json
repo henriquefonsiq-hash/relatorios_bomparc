@@ -1,0 +1,14 @@
+{
+  "Cinta Circular": {
+    "materia_prima": "POLIESTER",
+    "criterio_aceitacao": "ABNT NBR 15637-2"
+  },
+  "Cinta Sling": {
+    "materia_prima": "POLIESTER",
+    "criterio_aceitacao": "ABNT NBR 15637-1"
+  },
+  "MANILHA CURVA PPC": {
+    "materia_prima": "METAL",
+    "criterio_aceitacao": "ABNT NBR 13545"
+  }
+}

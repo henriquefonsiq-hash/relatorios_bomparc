@@ -1,0 +1,4 @@
+libreoffice
+fonts-lato
+fonts-liberation
+fonts-crosextra-carlito
