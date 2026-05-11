@@ -74,6 +74,14 @@ def parse_certificate_items(raw_items):
     return items
 
 
+def parse_serial_numbers(raw_serial_numbers):
+    return [
+        serial_number.strip()
+        for serial_number in re.split(r"[,;\n]+", raw_serial_numbers)
+        if serial_number.strip()
+    ]
+
+
 def convert_to_pdf(docx_path, pdf_path):
     if platform.system() == "Windows":
         pythoncom.CoInitialize()
@@ -419,7 +427,12 @@ item_certificado = col5.text_input("Item(s)", "", placeholder="32")
 st.subheader("2. Dados da Inspeção e Equipamento")
 col7, col9 = st.columns(2)
 data_inspecao = col7.date_input("Data da Inspeção", value=None, format="DD/MM/YYYY")
-ns = col9.text_input("NS (Número de Série)", "", placeholder="AST220S/03")
+ns = col9.text_area(
+    "NS (Número de Série)",
+    "",
+    placeholder="Uma NS para todos ou uma por item: AST220S/03, AST220S/04",
+    height=80,
+)
 
 col10, col11, col12 = st.columns(3)
 item = col10.selectbox("Equipamento", ["Selecione", *equipment_options, "Outro"], key="reprovado_equipamento_item")
@@ -479,11 +492,21 @@ if submit_button:
     with st.spinner("Processando documento..."):
         numero_certificado = numero_certificado.strip().strip("-")
         itens_certificado = parse_certificate_items(item_certificado)
+        numeros_serie = parse_serial_numbers(ns)
         unidade_capacidade = unidade_capacidade.strip().upper()
         norma_referencia = norma_referencia.strip()
 
         if not numero_certificado or not itens_certificado:
             st.error("Preencha o Número do relatório e pelo menos um Item para gerar o relatório.")
+            st.stop()
+        if not numeros_serie:
+            st.error("Preencha pelo menos um NS (Número de Série) para gerar o relatório.")
+            st.stop()
+        if len(numeros_serie) not in (1, len(itens_certificado)):
+            st.error(
+                "A quantidade de NS deve ser 1 para repetir em todos os itens "
+                "ou igual à quantidade de Item(s)."
+            )
             st.stop()
         if data_inspecao is None:
             st.error("Preencha a Data da Inspeção para gerar o relatório.")
@@ -520,8 +543,9 @@ if submit_button:
         with tempfile.TemporaryDirectory() as temp_dir:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for item_certificado_atual in itens_certificado:
+                for index, item_certificado_atual in enumerate(itens_certificado):
                     certif = f"{numero_certificado}-{item_certificado_atual}-RI"
+                    numero_serie_atual = numeros_serie[0] if len(numeros_serie) == 1 else numeros_serie[index]
                     nome_base_arquivo = " ".join(
                         safe_filename_part(part)
                         for part in (certif, "REPROVADO", item, data_arquivo_str)
@@ -546,7 +570,7 @@ if submit_button:
                         "LOCAL DO TESTE (Local of the Test):": embarcacao,
                         "ENDEREÇO (Address):": endereco,
                         "EQUIPAMENTO (Equipment):": equipamento,
-                        "SÉRIE (Serial Number):": ns,
+                        "SÉRIE (Serial Number):": numero_serie_atual,
                         "DATA DA INSPEÇÃO (Date):": data_str,
                         "NOTA FISCAL (Invoice):": "",
                         "NORMA DE REFERÊNCIA (Normative Reference):": norma_referencia,

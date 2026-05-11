@@ -269,6 +269,14 @@ def parse_certificate_items(raw_items):
     return items
 
 
+def parse_serial_numbers(raw_serial_numbers):
+    return [
+        serial_number.strip()
+        for serial_number in re.split(r"[,;\n]+", raw_serial_numbers)
+        if serial_number.strip()
+    ]
+
+
 def safe_filename_part(value):
     cleaned = re.sub(r'[<>:"/\\\\|?*]+', "-", str(value)).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
@@ -351,7 +359,12 @@ with st.container():
     st.subheader("2. Dados da Inspeção e Equipamento")
     col7, col8, col9 = st.columns(3)
     data_inspecao = col7.date_input("Data da Inspeção", value=None, format="DD/MM/YYYY")
-    ns = col8.text_input("NS (Número de Série)", "", placeholder="AST220S/03")
+    ns = col8.text_area(
+        "NS (Número de Série)",
+        "",
+        placeholder="Uma NS para todos ou uma por item: AST220S/03, AST220S/04",
+        height=80,
+    )
     item = col9.selectbox(
         "Equipamento",
         ["Selecione", *equipment_options, "Outro"],
@@ -413,8 +426,18 @@ if submit_button:
     with st.spinner("Processando documento..."):
         numero_certificado = numero_certificado.strip().strip("-")
         itens_certificado = parse_certificate_items(item_certificado)
+        numeros_serie = parse_serial_numbers(ns)
         if not numero_certificado or not itens_certificado:
             st.error("Preencha o Número do certificado e pelo menos um Item para gerar o relatório.")
+            st.stop()
+        if not numeros_serie:
+            st.error("Preencha pelo menos um NS (Número de Série) para gerar o relatório.")
+            st.stop()
+        if len(numeros_serie) not in (1, len(itens_certificado)):
+            st.error(
+                "A quantidade de NS deve ser 1 para repetir em todos os itens "
+                "ou igual à quantidade de Item(s)."
+            )
             st.stop()
         unidade_capacidade = unidade_capacidade.strip().upper()
         if not unidade_capacidade:
@@ -565,8 +588,9 @@ if submit_button:
         with tempfile.TemporaryDirectory() as temp_dir:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for item_certificado_atual in itens_certificado:
+                for index, item_certificado_atual in enumerate(itens_certificado):
                     certif = f"{numero_certificado}-{item_certificado_atual}"
+                    numero_serie_atual = numeros_serie[0] if len(numeros_serie) == 1 else numeros_serie[index]
                     nome_base_arquivo = " ".join(
                         safe_filename_part(part)
                         for part in (certif, item, data_arquivo_str)
@@ -578,7 +602,7 @@ if submit_button:
                         "LOCAL DO TESTE (Local of the Test):": embarcacao,
                         "ENDEREÇO (Address):": endereco,
                         "EQUIPAMENTO (Equipment):": equipamento,
-                        "SÉRIE (Serial Number):": ns,
+                        "SÉRIE (Serial Number):": numero_serie_atual,
                         "DATA DA INSPEÇÃO (Date):": data_str,
                         "DATA DE VALIDADE (Validity Date):": data_validade_str,
                         "CRITÉRIO DE ACEITAÇÃO (Criteria of accept):": criterio,
