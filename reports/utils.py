@@ -99,6 +99,7 @@ def replace_placeholder(paragraph, placeholder, value, color=None):
     """
     Substitui o placeholder no parágrafo de forma cirúrgica, 
     preservando a formatação individual de cada 'run' (pedaço de texto).
+    Força o texto substituído a não ser negrito para manter elegância.
     """
     import re
     
@@ -138,6 +139,7 @@ def replace_placeholder(paragraph, placeholder, value, color=None):
             r_first.text = prefix + val_str + suffix
             if color: r_first.font.color.rgb = color
             else: r_first.font.color.rgb = None
+            r_first.font.bold = False  # Força fonte fina (estilo Ideal)
         else:
             last = runs_involved[-1]
             r_last = last["run"]
@@ -145,6 +147,7 @@ def replace_placeholder(paragraph, placeholder, value, color=None):
             r_first.text = prefix + val_str
             if color: r_first.font.color.rgb = color
             else: r_first.font.color.rgb = None
+            r_first.font.bold = False  # Força fonte fina (estilo Ideal)
             for i in range(1, len(runs_involved) - 1):
                 runs_involved[i]["run"].text = ""
             r_last.text = suffix
