@@ -206,7 +206,7 @@ def _build_aprovado_doc(campos):
         "Dimensão":              campos["dimensao"],
         "Quantidade":            f"{campos['quantidade']:02d} UNIDADE",
         "Matéria Prima":         campos["materia_prima"],
-        "Teste":                 campos["test"],
+        "Teste":                 campos["teste"],
         "END":                   campos["end"],
         "Laudo Final":           campos["aprov"],
         "Observações":           campos["obs"],
