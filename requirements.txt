@@ -1,4 +1,5 @@
 streamlit
 python-docx
 Pillow
+mammoth
 pywin32; sys_platform == 'win32'

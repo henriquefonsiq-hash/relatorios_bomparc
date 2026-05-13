@@ -1,59 +1,75 @@
-import streamlit as st
-import docx
+"""
+FOR-BPC-5137 — Relatório de Inspeção Visual de Equipamento
+
+Layout: formulário à esquerda | pré-visualização ao vivo à direita.
+A prévia atualiza automaticamente a cada alteração no formulário,
+usando mammoth (docx→HTML, ~100ms) sem necessidade de botão.
+
+Roteamento de máscaras:
+  APROVADO  → template.docx             (FOR-BPC-5137)
+  REPROVADO → template_reprovados.docx  (FOR-BPC-5112)
+  END LP    → template_5113_lp.docx     (FOR-BPC-5113) - Anexado como página extra
+  END PM    → template_5114_pm.docx     (FOR-BPC-5114) - Anexado como página extra
+"""
+
+import base64
 import io
 import os
-from datetime import date
 import re
 import tempfile
 import zipfile
-from docx.table import _Cell
+from datetime import date, timedelta
+
+import docx
+import mammoth
+import streamlit as st
+import streamlit.components.v1 as components
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-from docx.shared import Pt, RGBColor
-from PIL import Image, ImageChops, ImageOps
+from docx.oxml.ns import qn
+from docx.shared import Inches
+from PIL import Image, ImageOps
+
 from client_registry import load_client_registry
 from equipment_registry import load_equipment_registry
+from reports.utils import (
+    RED_VALUE,
+    SIGNATURE_AREA_FILL,
+    SIGNATURE_CANVAS_HEIGHT_PX,
+    add_photo_to_cell,
+    add_signature_to_cell,
+    convert_to_pdf,
+    crop_signature_whitespace,
+    format_conversion_error,
+    list_signature_files,
+    parse_certificate_items,
+    replace_placeholder,
+    process_replacements,
+    safe_filename_part,
+    set_cell_text,
+    signature_label,
+    word_value,
+    append_document,
+)
+from reports.engine_5112 import build_5112
+from reports.engine_5113 import build_5113
+from reports.engine_5114 import build_5114
 
-st.title("Gerador Automático de Relatório - BOMPARC")
-st.markdown("Preencha o formulário abaixo para gerar o relatório de Inspeção Visual (Word e PDF).")
-
-import platform
-import subprocess
+# ── Constantes ───────────────────────────────────────────────────────────────
 
 APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TECHNICIAN_SIGNATURE_DIR = os.path.join(APP_DIR, "assinatura técnicos")
-QUALITY_SIGNATURE_DIR = os.path.join(APP_DIR, "assinatura qualidade")
-SIGNATURE_EXTENSIONS = (".jpg", ".jpeg", ".png")
-SIGNATURE_AREA_FILL = 0.82
-SIGNATURE_CANVAS_HEIGHT_PX = 700
-QUALITY_SIGNATURE_TARGET = "media/image1.jpeg"
+TECHNICIAN_SIGNATURE_DIR    = os.path.join(APP_DIR, "assinatura técnicos")
+QUALITY_SIGNATURE_DIR       = os.path.join(APP_DIR, "assinatura qualidade")
+TEMPLATE_APROVADO           = os.path.join(APP_DIR, "template.docx")
+TEMPLATE_REPROVADO          = os.path.join(APP_DIR, "template_reprovados.docx")
+QUALITY_SIGNATURE_TARGET    = "media/image1.jpeg"
 TECHNICIAN_SIGNATURE_TARGET = "media/image3.jpeg"
-IDEAL_TABLE_GRID_WIDTHS = [7620, 1688465, 469265, 407035, 747395, 361315, 739140, 786130, 1710055]
+
+IDEAL_TABLE_GRID_WIDTHS            = [7620, 1688465, 469265, 407035, 747395, 361315, 739140, 786130, 1710055]
 IDEAL_EQUIPMENT_DETAIL_CELL_WIDTHS = [3398, 3551, 3931]
-IDEAL_SIGNATURE_CELL_WIDTHS = [2671, 1380, 2910, 1238, 2693]
-RED_VALUE = RGBColor(255, 0, 0)
-VALUE_FONT_SIZE = Pt(9)
-if platform.system() == "Windows":
-    import pythoncom
-    import win32com.client
+IDEAL_SIGNATURE_CELL_WIDTHS        = [2671, 1380, 2910, 1238, 2693]
 
-
-def list_signature_files(signature_dir):
-    if not os.path.isdir(signature_dir):
-        return []
-    return sorted(
-        os.path.join(signature_dir, name)
-        for name in os.listdir(signature_dir)
-        if name.lower().endswith(SIGNATURE_EXTENSIONS)
-    )
-
-
-def signature_label(path):
-    if path is None:
-        return "Selecione"
-    return os.path.splitext(os.path.basename(path))[0]
-
+# ── Utilitários — template APROVADO (5137) ───────────────────────────────────
 
 def paragraph_has_image_target(paragraph, target_ref):
     for blip in paragraph._element.iter(qn("a:blip")):
@@ -62,69 +78,35 @@ def paragraph_has_image_target(paragraph, target_ref):
             return True
     return False
 
-
 def first_descendant(element, tag):
     return next(element.iter(qn(tag)), None)
-
-
-def crop_signature_whitespace(image):
-    image = ImageOps.exif_transpose(image).convert("RGBA")
-    white = Image.new("RGBA", image.size, (255, 255, 255, 255))
-    flattened = Image.alpha_composite(white, image).convert("RGB")
-    diff = ImageChops.difference(flattened, Image.new("RGB", flattened.size, "white")).convert("L")
-    mask = diff.point(lambda pixel: 255 if pixel > 18 else 0)
-    bbox = mask.getbbox()
-    if bbox is None:
-        return image
-
-    left, top, right, bottom = bbox
-    padding = 6
-    left = max(left - padding, 0)
-    top = max(top - padding, 0)
-    right = min(right + padding, image.width)
-    bottom = min(bottom + padding, image.height)
-    return image.crop((left, top, right, bottom))
-
 
 def make_signature_fit_canvas(signature_path, target_cx, target_cy):
     if not target_cx or not target_cy:
         return signature_path
-
     with Image.open(signature_path) as source:
         signature = crop_signature_whitespace(source)
-
     aspect_ratio = target_cx / target_cy
     canvas_height = SIGNATURE_CANVAS_HEIGHT_PX
-    canvas_width = max(1, int(round(canvas_height * aspect_ratio)))
-    max_width = max(1, int(canvas_width * SIGNATURE_AREA_FILL))
+    canvas_width  = max(1, int(round(canvas_height * aspect_ratio)))
+    max_width  = max(1, int(canvas_width  * SIGNATURE_AREA_FILL))
     max_height = max(1, int(canvas_height * SIGNATURE_AREA_FILL))
-
-    scale = min(max_width / signature.width, max_height / signature.height)
-    new_size = (
-        max(1, int(round(signature.width * scale))),
-        max(1, int(round(signature.height * scale))),
-    )
+    scale    = min(max_width / signature.width, max_height / signature.height)
+    new_size = (max(1, int(round(signature.width * scale))), max(1, int(round(signature.height * scale))))
     signature = signature.resize(new_size, Image.Resampling.LANCZOS)
-
     canvas = Image.new("RGBA", (canvas_width, canvas_height), (255, 255, 255, 0))
-    x = int((canvas_width - signature.width) / 2)
-    y = int((canvas_height - signature.height) / 2)
-    canvas.alpha_composite(signature, (x, y))
-
+    canvas.alpha_composite(signature, (int((canvas_width - signature.width) / 2), int((canvas_height - signature.height) / 2)))
     fd, fitted_path = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     canvas.save(fitted_path)
     return fitted_path
 
-
 def keep_cell_text_on_one_line(cell):
     tc_pr = cell._tc.get_or_add_tcPr()
-    no_wrap = tc_pr.find(qn("w:noWrap"))
-    if no_wrap is None:
+    if tc_pr.find(qn("w:noWrap")) is None:
         tc_pr.append(OxmlElement("w:noWrap"))
     for paragraph in cell.paragraphs:
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
 
 def set_cell_width(cell, width):
     tc_pr = cell._tc.get_or_add_tcPr()
@@ -135,68 +117,35 @@ def set_cell_width(cell, width):
     tc_w.set(qn("w:w"), str(width))
     tc_w.set(qn("w:type"), "dxa")
 
-
 def apply_ideal_table_dimensions(doc):
     if not doc.tables:
         return
-
     table = doc.tables[0]
-    grid_columns = table._tbl.tblGrid.gridCol_lst
-    for grid_column, width in zip(grid_columns, IDEAL_TABLE_GRID_WIDTHS):
-        grid_column.w = width
-
+    for col, width in zip(table._tbl.tblGrid.gridCol_lst, IDEAL_TABLE_GRID_WIDTHS):
+        col.w = width
     if len(table.rows) <= 17:
         return
+    from docx.table import _Cell as DocxCell
+    for row_idx in (6, 7):
+        for tc, w in zip(list(table.rows[row_idx]._tr.tc_lst), IDEAL_EQUIPMENT_DETAIL_CELL_WIDTHS):
+            set_cell_width(DocxCell(tc, table), w)
+    for row_idx in (16, 17):
+        for tc, w in zip(list(table.rows[row_idx]._tr.tc_lst), IDEAL_SIGNATURE_CELL_WIDTHS):
+            set_cell_width(DocxCell(tc, table), w)
 
-    for row_index in (6, 7):
-        real_cells = list(table.rows[row_index]._tr.tc_lst)
-        for tc, width in zip(real_cells, IDEAL_EQUIPMENT_DETAIL_CELL_WIDTHS):
-            set_cell_width(_Cell(tc, table), width)
-
-    for row_index in (16, 17):
-        real_cells = list(table.rows[row_index]._tr.tc_lst)
-        for tc, width in zip(real_cells, IDEAL_SIGNATURE_CELL_WIDTHS):
-            set_cell_width(_Cell(tc, table), width)
-
-
-def remove_empty_trailing_paragraphs(doc):
-    body = doc._element.body
-
-    for child in reversed(list(body)):
-        if child.tag == qn("w:sectPr"):
-            continue
-
-        if child.tag != qn("w:p"):
-            break
-
-        has_text = any((text.text or "").strip() for text in child.iter(qn("w:t")))
-        has_drawing = any(child.iter(qn("w:drawing")))
-        has_page_break = any(
-            break_element.get(qn("w:type")) == "page"
-            for break_element in child.iter(qn("w:br"))
-        )
-
-        if has_text or has_drawing or has_page_break:
-            break
-
-        body.remove(child)
-
-
-def replace_signature(doc, signature_path, target_ref):
+def replace_signature_aprovado(doc, signature_path, target_ref):
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for paragraph in cell.paragraphs:
                     if not paragraph_has_image_target(paragraph, target_ref):
                         continue
-
                     for drawing in paragraph._element.iter(qn("w:drawing")):
                         for blip in drawing.iter(qn("a:blip")):
                             rel_id = blip.get(qn("r:embed"))
                             if not rel_id or paragraph.part.rels[rel_id].target_ref != target_ref:
                                 continue
-
-                            extent = first_descendant(drawing, "wp:extent")
+                            extent    = first_descendant(drawing, "wp:extent")
                             target_cx = int(extent.get("cx")) if extent is not None else None
                             target_cy = int(extent.get("cy")) if extent is not None else None
                             fitted_path = make_signature_fit_canvas(signature_path, target_cx, target_cy)
@@ -205,7 +154,6 @@ def replace_signature(doc, signature_path, target_ref):
                             finally:
                                 if fitted_path != signature_path and os.path.exists(fitted_path):
                                     os.remove(fitted_path)
-
                             blip.set(qn("r:embed"), new_rel_id)
                             anchor = first_descendant(drawing, "wp:anchor")
                             if anchor is not None:
@@ -213,467 +161,399 @@ def replace_signature(doc, signature_path, target_ref):
                             return True
     return False
 
-
-def validate_template(doc):
+def validate_template_aprovado(doc):
     if not doc.tables:
         return "O template.docx não possui tabela principal."
-
     table = doc.tables[0]
     if len(table.rows) <= 17:
         return "A tabela principal do template.docx precisa ter pelo menos 18 linhas."
-
-    for row_index in (16, 17):
-        if len(table.rows[row_index].cells) <= 7:
-            return "As linhas de assinatura do template.docx precisam ter pelo menos 8 colunas."
-
-    image_targets = {
-        rel.target_ref
-        for rel in doc.part.rels.values()
-        if rel.target_ref.startswith("media/image")
-    }
-    missing_targets = [
-        target
-        for target in (QUALITY_SIGNATURE_TARGET, TECHNICIAN_SIGNATURE_TARGET)
-        if target not in image_targets
-    ]
-    if missing_targets:
-        return "O template.docx não possui as imagens-base de assinatura esperadas: " + ", ".join(missing_targets)
-
+    for row_idx in (16, 17):
+        if len(table.rows[row_idx].cells) <= 7:
+            return "As linhas de assinatura precisam ter pelo menos 8 colunas."
+    image_targets = {r.target_ref for r in doc.part.rels.values() if r.target_ref.startswith("media/image")}
+    missing = [t for t in (QUALITY_SIGNATURE_TARGET, TECHNICIAN_SIGNATURE_TARGET) if t not in image_targets]
+    if missing:
+        return "O template.docx não possui as imagens-base de assinatura: " + ", ".join(missing)
     return None
 
 
-def format_conversion_error(error):
-    if platform.system() == "Windows":
-        return (
-            "Não foi possível converter o relatório para PDF. "
-            "Verifique se o Microsoft Word está instalado e fechado, e tente novamente. "
-            f"Detalhe técnico: {error}"
-        )
+# ── Build dos documentos (retornam Objeto Document) ──────────────────────────
 
-    return (
-        "Não foi possível converter o relatório para PDF. "
-        "Verifique se o LibreOffice está instalado no ambiente. "
-        f"Detalhe técnico: {error}"
-    )
+def _build_aprovado_doc(campos):
+    if not os.path.exists(TEMPLATE_APROVADO):
+        raise FileNotFoundError(f"'template.docx' não encontrado em {APP_DIR}.")
+
+    item_atual    = campos["itens_certificado"][0]
+    certif        = f"{campos['numero_certificado']}-{item_atual}"
+    os_digits     = campos['numero_certificado'][:4]
+
+    replacements = {
+        # Tags Simples
+        "Relatório":             certif,
+        "Número do Certificado": certif,
+        "Item(s)":               item_atual,
+        "Cliente":               campos["cliente"],
+        "Embarcação":            campos["embarcacao"],
+        "Endereço":              campos["endereco"],
+        "Equipamento":           campos["equipamento_str"],
+        "Série":                 campos["ns"],
+        "Data":                  campos["data_str"],
+        "Data de Validade":      campos["data_validade_str"],
+        "Critério de Aceitação": campos["criterio"],
+        "Carga de Trabalho":     campos["carga_trabalho"],
+        "Capacidade":            f"{campos['capac']:g}",
+        "Unidade":               campos["unidade_capac"],
+        "Dimensão":              campos["dimensao"],
+        "Quantidade":            f"{campos['quantidade']:02d} UNIDADE",
+        "Matéria Prima":         campos["materia_prima"],
+        "Teste":                 campos["test"],
+        "END":                   campos["end"],
+        "Laudo Final":           campos["aprov"],
+        "Observações":           campos["obs"],
+        "Ordem de Serviço":      os_digits,
+
+        # Sinônimos Longos (para bater com os nomes dos campos na tela)
+        "NS (Número de Série)":             campos["ns"],
+        "Data de Inspeção":                 campos["data_str"],
+        "Data de Inspeção 2":               campos["data_str"],
+        "Critério de Aceitação / Norma":    campos["criterio"],
+        "Data de Validade (Validity Date)": campos["data_validade_str"],
+    }
+
+    doc_out = docx.Document(TEMPLATE_APROVADO)
+    err = validate_template_aprovado(doc_out)
+    if err:
+        raise ValueError(err)
+
+    if campos.get("assinatura_qualidade"):
+        replace_signature_aprovado(doc_out, campos["assinatura_qualidade"], QUALITY_SIGNATURE_TARGET)
+    if campos.get("assinatura_tecnico"):
+        replace_signature_aprovado(doc_out, campos["assinatura_tecnico"], TECHNICIAN_SIGNATURE_TARGET)
+
+    process_replacements(doc_out, replacements)
+
+    sig_table = doc_out.tables[0]
+    for cell_idx in (2, 7):
+        keep_cell_text_on_one_line(sig_table.rows[16].cells[cell_idx])
+        keep_cell_text_on_one_line(sig_table.rows[17].cells[cell_idx])
+    apply_ideal_table_dimensions(doc_out)
+
+    return doc_out
 
 
-def parse_certificate_items(raw_items):
-    items = []
-    seen = set()
-    for raw_item in re.split(r"[,;\n]+", raw_items):
-        item_value = re.sub(r"(?i)^item\s+", "", raw_item.strip()).strip("- ")
-        if not item_value or item_value in seen:
-            continue
-        items.append(item_value)
-        seen.add(item_value)
-    return items
-
-
-def parse_serial_numbers(raw_serial_numbers):
-    return [
-        serial_number.strip()
-        for serial_number in re.split(r"[,;\n]+", raw_serial_numbers)
-        if serial_number.strip()
-    ]
-
-
-def safe_filename_part(value):
-    cleaned = re.sub(r'[<>:"/\\\\|?*]+', "-", str(value)).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip(". ") or "relatorio"
-
-
-def word_value(value):
-    return str(value).upper()
-
-# Função para converter DOCX para PDF (Nuvem ou Local)
-def convert_to_pdf(docx_path, pdf_path):
-    if platform.system() == "Windows":
-        # O Streamlit roda em threads, o Windows exige CoInitialize() para comunicação COM
-        pythoncom.CoInitialize()
-        word = None
-        doc = None
-        try:
-            word = win32com.client.Dispatch("Word.Application")
-            word.Visible = False
-            doc = word.Documents.Open(os.path.abspath(docx_path))
-            doc.SaveAs(os.path.abspath(pdf_path), FileFormat=17) # 17 = PDF
-        finally:
-            if doc is not None:
-                doc.Close(False)
-            if word is not None:
-                word.Quit()
-            pythoncom.CoUninitialize()
+def _build_documento(campos):
+    """Orquestra a criação do documento completo, incluindo páginas extras de END."""
+    # 1. Gera o documento base (Visual ou Reprovado)
+    if campos["aprov"] == "REPROVADO":
+        main_doc = build_5112(campos)
     else:
-        # Nuvem (Linux) - Utiliza o LibreOffice via linha de comando
-        subprocess.run([
-            "libreoffice", "--headless", "--convert-to", "pdf",
-            os.path.abspath(docx_path),
-            "--outdir", os.path.dirname(os.path.abspath(pdf_path))
-        ], check=True)
+        main_doc = _build_aprovado_doc(campos)
+    
+    # 2. Anexa páginas adicionais para cada END selecionado
+    if "LP" in campos["end_selected"]:
+        doc_lp = build_5113(campos)
+        append_document(main_doc, doc_lp)
+        
+    if "PM" in campos["end_selected"]:
+        doc_pm = build_5114(campos)
+        append_document(main_doc, doc_pm)
 
-    if not os.path.exists(pdf_path):
-        raise RuntimeError("o arquivo PDF não foi criado.")
+    # 3. Salva em bytes para prévia ou download
+    buf = io.BytesIO()
+    main_doc.save(buf)
+    return buf.getvalue()
 
+
+# ── Prévia ao vivo: docx → HTML via mammoth ──────────────────────────────────
+
+_PREVIEW_CSS = """
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: Arial, sans-serif;
+    font-size: 10px;
+    background: #f0f0f0;
+    padding: 16px;
+  }
+  .page {
+    background: white;
+    width: 100%;
+    padding: 18px 20px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    border-radius: 3px;
+    margin-bottom: 20px;
+  }
+  p  { margin: 2px 0; line-height: 1.4; }
+  strong { font-weight: bold; }
+  em { font-style: italic; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 6px 0;
+    font-size: 9px;
+  }
+  td, th {
+    border: 1px solid #333;
+    padding: 3px 5px;
+    vertical-align: top;
+  }
+  img {
+    max-width: 100%;
+    height: auto;
+  }
+  /* destaca campos preenchidos em vermelho (NS, datas) */
+  span.filled-red { color: #c00; font-weight: bold; }
+</style>
+"""
+
+def _docx_bytes_to_html(docx_bytes):
+    """Converte bytes de docx para HTML usando mammoth."""
+    def convert_image(image):
+        with image.open() as f:
+            data = f.read()
+        b64 = base64.b64encode(data).decode()
+        ct  = image.content_type or "image/png"
+        return {"src": f"data:{ct};base64,{b64}"}
+
+    result = mammoth.convert_to_html(
+        io.BytesIO(docx_bytes),
+        convert_image=mammoth.images.img_element(convert_image),
+    )
+    return result.value
+
+
+def _render_preview(campos):
+    """Gera e exibe a prévia HTML do documento no painel direito."""
+    try:
+        docx_bytes = _build_documento(campos)
+        html_body  = _docx_bytes_to_html(docx_bytes)
+        full_html  = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">{_PREVIEW_CSS}</head>
+<body><div class="page">{html_body}</div></body></html>"""
+        components.html(full_html, height=780, scrolling=True)
+    except Exception as e:
+        st.warning(f"Pré-visualização indisponível: {e}")
+
+
+# ── Monta campos sem validação (para prévia parcial) ─────────────────────────
+
+def _campos_parciais(
+    numero_certificado, item_certificado, cliente, embarcacao, endereco,
+    data_inspecao, ns, item, criterio, capac, unidade_capac, dimensao,
+    quantidade, materia_prima, teste, end, end_selected, aprov, obs,
+    assinatura_qualidade, signature_tecnico,
+    descricao_insuficiencia, foto_reprovado,
+):
+    """Monta o dicionário de campos usando defaults seguros para valores vazios."""
+
+    num   = numero_certificado.strip().strip("-") or "XXXXXXXX"
+    itens = parse_certificate_items(item_certificado) or ["00"]
+    uni   = unidade_capac.strip().upper() or "TON"
+    cap   = capac if capac is not None else 0.0
+    qty   = quantidade if quantidade is not None else 1
+
+    data_str     = data_inspecao.strftime("%d/%m/%Y") if data_inspecao else "__/__/____"
+    data_arq_str = data_inspecao.strftime("%d-%m-%Y")  if data_inspecao else "00-00-0000"
+    
+    # Lógica de Validade: Inspeção + 1 ano (com tratamento para ano bissexto)
+    if data_inspecao:
+        try:
+            validade_dt = data_inspecao.replace(year=data_inspecao.year + 1)
+        except ValueError:
+            validade_dt = data_inspecao.replace(year=data_inspecao.year + 1, day=28)
+        data_val_str = validade_dt.strftime("%d/%m/%Y")
+    else:
+        data_val_str = "__/__/____"
+
+    if uni == "TON" and cap > 0:
+        carga = f"{int(cap * 1000):,} KG".replace(",", ".")
+    elif cap > 0:
+        carga = f"{cap:g} {uni}"
+    else:
+        carga = ""
+
+    equip_str = f"{item.upper()} {cap:g} {uni} X {dimensao.upper()}" if item and cap else item or ""
+
+    return {
+        "numero_certificado":    num,
+        "itens_certificado":     itens,
+        "cliente":               cliente or "",
+        "embarcacao":            embarcacao or "",
+        "endereco":              endereco or "",
+        "ns":                    ns or "",
+        "data_str":              data_str,
+        "data_arquivo_str":      data_arq_str,
+        "data_validade_str":     data_val_str,
+        "item":                  item or "",
+        "criterio":              criterio or "",
+        "capac":                 cap,
+        "unidade_capac":         uni,
+        "dimensao":              dimensao or "",
+        "quantidade":            qty,
+        "materia_prima":         materia_prima or "",
+        "teste":                 teste or "",
+        "carga_trabalho":        carga,
+        "equipamento_str":       equip_str,
+        "end":                   end or "",
+        "end_selected":          end_selected or [],
+        "aprov":                 aprov if aprov else "APROVADO",
+        "obs":                   obs or "",
+        "assinatura_qualidade":  assinatura_qualidade,
+        "assinatura_tecnico":    signature_tecnico,
+        "descricao_insuficiencia": descricao_insuficiencia or "",
+        "foto_reprovado":        foto_reprovado,
+    }
+
+
+# ── Validação estrita (para geração final) ───────────────────────────────────
+
+def _validar_campos(campos_p):
+    erros = []
+    if campos_p["numero_certificado"] == "XXXXXXXX":
+        erros.append("Preencha o Número do certificado.")
+    if campos_p["itens_certificado"] == ["00"]:
+        erros.append("Preencha pelo menos um Item.")
+    if not campos_p["unidade_capac"]:
+        erros.append("Preencha a Unidade da capacidade.")
+    if not campos_p["criterio"]:
+        erros.append("Preencha o Critério de Aceitação.")
+    if campos_p["data_str"] == "__/__/____":
+        erros.append("Preencha a Data da Inspeção.")
+    if not campos_p["item"]:
+        erros.append("Preencha o Equipamento.")
+    if campos_p["capac"] == 0.0:
+        erros.append("Preencha a Capacidade.")
+    return erros
+
+
+# ── Geração do ZIP final ──────────────────────────────────────────────────────
+
+def _gerar_zip(campos):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for item_atual in campos["itens_certificado"]:
+                campos_item = {**campos, "itens_certificado": [item_atual]}
+                docx_bytes = _build_documento(campos_item)
+                sufixo = "REPROVADO" if campos["aprov"] == "REPROVADO" else ""
+                certif_str = f"{campos['numero_certificado']}-{item_atual}" + ("-RI" if sufixo else "")
+                if "LP" in campos["end_selected"]: certif_str += "-LP"
+                if "PM" in campos["end_selected"]: certif_str += "-PM"
+                nome_base  = " ".join(safe_filename_part(p) for p in filter(None, (certif_str, sufixo, campos["item"], campos["data_arquivo_str"])))
+                docx_path = os.path.join(temp_dir, f"{nome_base}.docx")
+                pdf_path  = os.path.join(temp_dir, f"{nome_base}.pdf")
+                with open(docx_path, "wb") as f: f.write(docx_bytes)
+                convert_to_pdf(docx_path, pdf_path)
+                zip_file.write(docx_path, os.path.basename(docx_path))
+                zip_file.write(pdf_path,  os.path.basename(pdf_path))
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# INTERFACE
+# ════════════════════════════════════════════════════════════════════════════
+
+st.set_page_config(layout="wide")
+st.title("Gerador Automático de Relatório — BOMPARC")
 
 equipment_registry = load_equipment_registry()
-equipment_options = sorted(equipment_registry)
-client_registry = load_client_registry()
-client_options = sorted(client_registry)
+equipment_options  = sorted(equipment_registry)
+client_registry    = load_client_registry()
+client_options     = sorted(client_registry)
 
+col_form, col_preview = st.columns([1, 1], gap="large")
 
-# --- FORMULÁRIO ---
-with st.container():
+with col_form:
     st.subheader("1. Identificação e Local")
-    col1, col2, col3 = st.columns(3)
-    cliente = col1.selectbox(
-        "Cliente",
-        ["Selecione", *client_options, "Outro"],
-        key="cliente_item",
-    )
-    if cliente == "Selecione":
-        cliente = ""
-    if cliente == "Outro":
-        cliente = col1.text_input("Especifique o Cliente", "", key="cliente_outro", placeholder="DOF SUBSEA BRASIL SERVIÇOS LTDA")
-
+    c1, c2, c3 = st.columns(3)
+    cliente = c1.selectbox("Cliente", ["Selecione", *client_options, "Outro"], key="cliente_item")
+    if cliente == "Selecione": cliente = ""
+    if cliente == "Outro": cliente = c1.text_input("Especifique o Cliente", "", key="cliente_outro")
     vessel_options = sorted(client_registry.get(cliente, {}))
-    embarcacao = col2.selectbox(
-        "Embarcação (Local do Teste)",
-        ["Selecione", *vessel_options, "Outro"],
-        key="embarcacao_item",
-    )
-    if embarcacao == "Selecione":
-        embarcacao = ""
-    if embarcacao == "Outro":
-        embarcacao = col2.text_input("Especifique a Embarcação", "", key="embarcacao_outro", placeholder="SKANDI CHIEFTAIN")
-
-    if st.session_state.get("ultima_embarcacao_cliente") != (cliente, embarcacao):
+    embarcacao = c2.selectbox("Embarcação", ["Selecione", *vessel_options, "Outro"], key="embarcacao_item")
+    if embarcacao == "Selecione": embarcacao = ""
+    if embarcacao == "Outro": embarcacao = c2.text_input("Especifique a Embarcação", "", key="embarcacao_outro")
+    if st.session_state.get("_ult_emb_cli") != (cliente, embarcacao):
         st.session_state["endereco_cliente"] = client_registry.get(cliente, {}).get(embarcacao, "")
-        st.session_state["ultima_embarcacao_cliente"] = (cliente, embarcacao)
-    endereco = col3.text_input("Endereço", key="endereco_cliente", placeholder="PORTO DO AÇU")
+        st.session_state["_ult_emb_cli"] = (cliente, embarcacao)
+    endereco = c3.text_input("Endereço", key="endereco_cliente")
+    c4, c5 = st.columns(2)
+    numero_certificado = c4.text_input("Número do certificado", "")
+    item_certificado   = c5.text_input("Item(s)", "")
 
-    col4, col5 = st.columns(2)
-    numero_certificado = col4.text_input("Número do certificado", "", placeholder="68430204")
-    item_certificado = col5.text_input("Item(s)", "", placeholder="32")
-    
     st.subheader("2. Dados da Inspeção e Equipamento")
-    col7, col8, col9 = st.columns(3)
-    data_inspecao = col7.date_input("Data da Inspeção", value=None, format="DD/MM/YYYY")
-    ns = col8.text_area(
-        "NS (Número de Série)",
-        "",
-        placeholder="Uma NS para todos ou uma por item: AST220S/03, AST220S/04",
-        height=80,
-    )
-    item = col9.selectbox(
-        "Equipamento",
-        ["Selecione", *equipment_options, "Outro"],
-        key="equipamento_item",
-    )
-    if item == "Selecione":
-        item = ""
-    if item == "Outro":
-        item = st.text_input("Especifique o Equipamento", "", key="equipamento_outro", placeholder="Manilha")
+    c6, c7, c8 = st.columns(3)
+    data_inspecao = c6.date_input("Data da Inspeção", value=None, format="DD/MM/YYYY")
+    ns            = c7.text_input("NS (Número de Série)", "")
+    item = c8.selectbox("Equipamento", ["Selecione", *equipment_options, "Outro"], key="equip_item")
+    if item == "Selecione": item = ""
+    if item == "Outro": item = st.text_input("Especifique o Equipamento", "", key="equip_outro")
+    if st.session_state.get("_ult_equip") != item:
+        cfg = equipment_registry.get(item, {})
+        st.session_state["criterio_aceitacao"] = cfg.get("criterio_aceitacao", "")
+        st.session_state["materia_prima"]       = cfg.get("materia_prima", "")
+        st.session_state["_ult_equip"] = item
+    criterio = st.text_input("Critério de Aceitação / Norma", key="criterio_aceitacao")
+    c9, c10, c11, c12 = st.columns(4)
+    capac         = c9.number_input("Capacidade", min_value=0.1, value=None, step=0.1)
+    unidade_capac = c10.text_input("Unidade", "")
+    dimensao      = c11.text_input("Dimensão", "")
+    quantidade    = c12.number_input("Quantidade", min_value=1, value=None, step=1)
+    c13, c14 = st.columns(2)
+    materia_prima = c13.text_input("Matéria Prima", key="materia_prima")
+    teste         = c14.text_input("Teste", "")
 
-    if st.session_state.get("ultimo_equipamento_item") != item:
-        equipment_config = equipment_registry.get(item, {})
-        st.session_state["criterio_aceitacao"] = equipment_config.get("criterio_aceitacao", "")
-        st.session_state["materia_prima"] = equipment_config.get("materia_prima", "")
-        st.session_state["ultimo_equipamento_item"] = item
-    criterio = st.text_input("Critério de Aceitação", key="criterio_aceitacao", placeholder="ABNT NBR 15637-1")
-        
-    col10, col11, col12, col13 = st.columns(4)
-    capac = col10.number_input("Capacidade (Capac)", min_value=0.1, value=None, step=0.1, placeholder="3.00")
-    unidade_capacidade = col11.text_input("Unidade da capacidade", "", placeholder="TON")
-    dimensao = col12.text_input("Dimensão", "", placeholder="2 MTS")
-    quantidade = col13.number_input("Quantidade", min_value=1, value=None, step=1, placeholder="1")
-    
-    col14, col15 = st.columns(2)
-    materia_prima = col14.text_input("Matéria Prima", key="materia_prima", placeholder="POLIESTER")
-    teste = col15.text_input("Teste", "", placeholder="N/A")
-    
     st.subheader("3. Parâmetros e Parecer")
-    col16, col17, col18 = st.columns(3)
-    end = col16.text_input("END (Ensaio Não Destrutivo)", "", placeholder="N/A")
-    aprov = col17.selectbox("APROV (Laudo Final)", ["Selecione", "APROVADO", "REPROVADO"])
-    if aprov == "Selecione":
-        aprov = ""
-    obs = col18.text_area("OBS (Observações)", "", placeholder="NÃO HOUVE / NONE")
+    c15, c16 = st.columns(2)
+    end1 = c15.selectbox("Página Extra 1 (END)", ["N/A", "LP", "PM"])
+    end_selected = []
+    if end1 != "N/A":
+        end_selected.append(end1)
+        restante = "PM" if end1 == "LP" else "LP"
+        end2 = c16.selectbox("Página Extra 2 (END)", ["N/A", restante])
+        if end2 != "N/A": end_selected.append(end2)
+    end = ", ".join(end_selected) if end_selected else "N/A"
+    c15_2, c16_2 = st.columns(2)
+    aprov = c15_2.selectbox("Laudo Final (APROV)", ["Selecione", "APROVADO", "REPROVADO"])
+    if aprov == "Selecione": aprov = ""
+    obs   = c16_2.text_area("Observações (OBS)", "")
 
-    quality_signature_files = list_signature_files(QUALITY_SIGNATURE_DIR)
-    assinatura_qualidade = st.selectbox(
-        "Assinatura do Controle de Qualidade",
-        [None, *quality_signature_files],
-        format_func=signature_label,
-        index=0,
-    ) if quality_signature_files else None
-    if not quality_signature_files:
-        st.warning(f"Nenhuma assinatura encontrada na pasta {QUALITY_SIGNATURE_DIR}.")
+    descricao_insuficiencia = ""
+    foto_reprovado = []
+    if aprov == "REPROVADO":
+        st.divider()
+        st.subheader("4. Dados de Reprovados (FOR-BPC-5112)")
+        descricao_insuficiencia = st.text_area("Descrição da Insuficiência", "")
+        foto_reprovado = st.file_uploader("Fotos do equipamento reprovado", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 
-    signature_files = list_signature_files(TECHNICIAN_SIGNATURE_DIR)
-    assinatura_tecnico = st.selectbox(
-        "Assinatura do Técnico",
-        [None, *signature_files],
-        format_func=signature_label,
-        index=0,
-    ) if signature_files else None
-    if not signature_files:
-        st.warning(f"Nenhuma assinatura encontrada na pasta {TECHNICIAN_SIGNATURE_DIR}.")
+    st.divider()
+    quality_files = list_signature_files(QUALITY_SIGNATURE_DIR)
+    assinatura_qualidade = st.selectbox("Assinatura — Controle de Qualidade", [None, *quality_files], format_func=signature_label) if quality_files else None
+    tech_files = list_signature_files(TECHNICIAN_SIGNATURE_DIR)
+    assinatura_tecnico = st.selectbox("Assinatura — Técnico de Inspeção", [None, *tech_files], format_func=signature_label) if tech_files else None
 
-    submit_button = st.button("Gerar Relatórios")
+    st.divider()
+    submit_button = st.button("📄 Gerar Relatório Unificado (Word + PDF)", type="primary", use_container_width=True)
+
+campos = _campos_parciais(numero_certificado, item_certificado, cliente, embarcacao, endereco, data_inspecao, ns, item, criterio, capac, unidade_capac, dimensao, quantidade, materia_prima, teste, end, end_selected, aprov, obs, assinatura_qualidade, assinatura_tecnico, descricao_insuficiencia, foto_reprovado)
+
+with col_preview:
+    mascara_label = "FOR-BPC-5112" if campos["aprov"] == "REPROVADO" else "FOR-BPC-5137"
+    if campos["end_selected"]: mascara_label += " + " + " & ".join(campos["end_selected"])
+    st.subheader(f"Pré-visualização · {mascara_label}")
+    _render_preview(campos)
 
 if submit_button:
-    with st.spinner("Processando documento..."):
-        numero_certificado = numero_certificado.strip().strip("-")
-        itens_certificado = parse_certificate_items(item_certificado)
-        numeros_serie = parse_serial_numbers(ns)
-        if not numero_certificado or not itens_certificado:
-            st.error("Preencha o Número do certificado e pelo menos um Item para gerar o relatório.")
-            st.stop()
-        if not numeros_serie:
-            st.error("Preencha pelo menos um NS (Número de Série) para gerar o relatório.")
-            st.stop()
-        if len(numeros_serie) not in (1, len(itens_certificado)):
-            st.error(
-                "A quantidade de NS deve ser 1 para repetir em todos os itens "
-                "ou igual à quantidade de Item(s)."
-            )
-            st.stop()
-        unidade_capacidade = unidade_capacidade.strip().upper()
-        if not unidade_capacidade:
-            st.error("Preencha a unidade da capacidade para gerar o relatório.")
-            st.stop()
-        criterio = criterio.strip()
-        if not criterio:
-            st.error("Preencha o Critério de Aceitação para gerar o relatório.")
-            st.stop()
-        if data_inspecao is None:
-            st.error("Preencha a Data da Inspeção para gerar o relatório.")
-            st.stop()
-        if not item:
-            st.error("Preencha o Equipamento para gerar o relatório.")
-            st.stop()
-        if capac is None:
-            st.error("Preencha a Capacidade para gerar o relatório.")
-            st.stop()
-        if quantidade is None:
-            st.error("Preencha a Quantidade para gerar o relatório.")
-            st.stop()
-
-        # Regras Inteligentes
-        # 1. Data + 1 ano
-        data_str = data_inspecao.strftime("%d/%m/%Y")
-        data_arquivo_str = data_inspecao.strftime("%d-%m-%Y")
-        try:
-            data_validade_str = data_inspecao.replace(year=data_inspecao.year + 1).strftime("%d/%m/%Y")
-        except ValueError: # Tratamento para ano bissexto (29/02)
-            data_validade_str = data_inspecao.replace(year=data_inspecao.year + 1, day=28).strftime("%d/%m/%Y")
-            
-        # 2. Equipamento = [Item] + [Capac] + [Unidade] + " X " + [Dimensao]
-        equipamento = f"{item.upper()} {capac:g} {unidade_capacidade} X {dimensao.upper()}"
-        
-        # 3. Carga de trabalho: TON vira KG; outras unidades permanecem como preenchidas
-        if unidade_capacidade == "TON":
-            carga_trabalho = f"{int(capac * 1000):,} KG".replace(",", ".")
-        else:
-            carga_trabalho = f"{capac:g} {unidade_capacidade}"
-        
-        # 4. OS: usa os 4 primeiros dígitos do número do certificado.
-        ordem_servico = f"BPC-OSTC-{numero_certificado[:4]}"
-
-        red_replacement_labels = {
-            "SÉRIE (Serial Number):",
-            "DATA DA INSPEÇÃO (Date):",
-            "DATA DE VALIDADE (Validity Date):",
-        }
-
-        following_paragraph_replacements = {
-            "DIMENSÕES (Dimensiones):": dimensao,
-            "MATÉRIA PRIMA (Feedstock):": materia_prima,
-            "QUANTIDADE": f"{quantidade:02d} UNIDADE",
-        }
-
-        # Carregar o DOCX
-        template_path = os.path.join(APP_DIR, "template.docx")
-        
-        if not os.path.exists(template_path):
-            st.error(f"Erro: Modelo 'template.docx' não encontrado na pasta {APP_DIR}.")
-            st.stop()
-
-        def set_paragraph_text_preserving_first_run(paragraph, value):
-            first_run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
-            first_run.text = word_value(value)
-            set_value_run_style(first_run)
-            for run in paragraph.runs[1:]:
-                run.text = ""
-
-        def set_value_run_style(run, color=None):
-            run.font.name = "Lato"
-            run.font.size = VALUE_FONT_SIZE
-            r_pr = run._element.get_or_add_rPr()
-            r_fonts = r_pr.rFonts
-            if r_fonts is None:
-                r_fonts = OxmlElement("w:rFonts")
-                r_pr.append(r_fonts)
-            for font_attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
-                r_fonts.set(qn(font_attr), "Lato")
-            if color is not None:
-                run.font.color.rgb = color
-
-        def replace_value_after_label(paragraph, label, value, color=None):
-            full_text = paragraph.text
-            if label not in full_text:
-                return False
-
-            value_start = full_text.index(label) + len(label)
-            value_start += len(full_text[value_start:]) - len(full_text[value_start:].lstrip())
-            value_end = len(full_text)
-
-            if value_start >= value_end:
-                if paragraph.runs:
-                    paragraph.runs[-1].text = paragraph.runs[-1].text.rstrip() + " "
-                    value_run = paragraph.add_run(word_value(value))
-                else:
-                    value_run = paragraph.add_run(word_value(value))
-                set_value_run_style(value_run, color)
-                return True
-
-            cursor = 0
-            inserted = False
-            for run in paragraph.runs:
-                original_text = run.text
-                run_start = cursor
-                run_end = cursor + len(original_text)
-                cursor = run_end
-
-                if run_end <= value_start:
-                    continue
-                if run_start >= value_end:
-                    run.text = ""
-                    continue
-
-                if not inserted:
-                    keep_before = original_text[:max(value_start - run_start, 0)]
-                    keep_after = original_text[max(value_end - run_start, 0):]
-                    run.text = keep_before + word_value(value) + keep_after
-                    set_value_run_style(run, color)
-                    inserted = True
-                else:
-                    keep_after = original_text[max(value_end - run_start, 0):]
-                    run.text = keep_after
-
-            return True
-
-        def replace_in_paragraphs(paragraphs, paragraph_replacements):
-            for i, p in enumerate(paragraphs):
-                p_text = p.text
-
-                for label, value in following_paragraph_replacements.items():
-                    if label in p_text and i + 1 < len(paragraphs):
-                        next_paragraph = paragraphs[i + 1]
-                        if ":" in next_paragraph.text:
-                            replace_value_after_label(next_paragraph, next_paragraph.text.split(":", 1)[0] + ":", value)
-                        else:
-                            set_paragraph_text_preserving_first_run(next_paragraph, value)
-                        break
-
-                for label, value in paragraph_replacements.items():
-                    color = RED_VALUE if label in red_replacement_labels else None
-                    if replace_value_after_label(p, label, value, color):
-                        break
-
-                if re.fullmatch(r"\s*\d{2}/\d{2}/\d{4}\s*", p_text):
-                    set_paragraph_text_preserving_first_run(p, data_str)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for index, item_certificado_atual in enumerate(itens_certificado):
-                    certif = f"{numero_certificado}-{item_certificado_atual}"
-                    numero_serie_atual = numeros_serie[0] if len(numeros_serie) == 1 else numeros_serie[index]
-                    nome_base_arquivo = " ".join(
-                        safe_filename_part(part)
-                        for part in (certif, item, data_arquivo_str)
-                    )
-
-                    paragraph_replacements = {
-                        "RELATÓRIO Nº (Number Report):": certif,
-                        "CLIENTE (Client):": cliente,
-                        "LOCAL DO TESTE (Local of the Test):": embarcacao,
-                        "ENDEREÇO (Address):": endereco,
-                        "EQUIPAMENTO (Equipment):": equipamento,
-                        "SÉRIE (Serial Number):": numero_serie_atual,
-                        "DATA DA INSPEÇÃO (Date):": data_str,
-                        "DATA DE VALIDADE (Validity Date):": data_validade_str,
-                        "CRITÉRIO DE ACEITAÇÃO (Criteria of accept):": criterio,
-                        "CARGA DE TRABALHO \n(Workload):": carga_trabalho,
-                        "IDENTIFICAÇÃO DE PLAQUETA (ID Plate):": certif,
-                        "ORDEM DE SERVIÇO (Service Order):": ordem_servico,
-                        "RELATÓRIO DE ENSAIO NÃO DESTRUTIVO (No-Destrutive Reheasal report):": end,
-                        "LAUDO FINAL (Final Report):": aprov,
-                        "Observações e Recomendações (Observation and Recommendations):": obs,
-                    }
-
-                    try:
-                        doc = docx.Document(template_path)
-                    except Exception as error:
-                        st.error(f"Erro ao abrir o template.docx: {error}")
-                        st.stop()
-
-                    template_error = validate_template(doc)
-                    if template_error:
-                        st.error(template_error)
-                        st.stop()
-
-                    if assinatura_qualidade and not replace_signature(
-                        doc,
-                        assinatura_qualidade,
-                        QUALITY_SIGNATURE_TARGET,
-                    ):
-                        st.error("Não foi possível encontrar a assinatura fixa do controle de qualidade no template.docx.")
-                        st.stop()
-
-                    if assinatura_tecnico and not replace_signature(
-                        doc,
-                        assinatura_tecnico,
-                        TECHNICIAN_SIGNATURE_TARGET,
-                    ):
-                        st.error("Não foi possível encontrar a assinatura fixa do técnico no template.docx.")
-                        st.stop()
-
-                    replace_in_paragraphs(doc.paragraphs, paragraph_replacements)
-
-                    for table in doc.tables:
-                        for row in table.rows:
-                            for cell in row.cells:
-                                replace_in_paragraphs(cell.paragraphs, paragraph_replacements)
-
-                    signature_table = doc.tables[0]
-                    for cell_index in (2, 7):
-                        keep_cell_text_on_one_line(signature_table.rows[16].cells[cell_index])
-                        keep_cell_text_on_one_line(signature_table.rows[17].cells[cell_index])
-                    apply_ideal_table_dimensions(doc)
-                    remove_empty_trailing_paragraphs(doc)
-
-                    output_docx = os.path.join(temp_dir, f"{nome_base_arquivo}.docx")
-                    output_pdf = os.path.join(temp_dir, f"{nome_base_arquivo}.pdf")
-
-                    doc.save(output_docx)
-                    try:
-                        convert_to_pdf(output_docx, output_pdf)
-                    except Exception as error:
-                        st.error(format_conversion_error(error))
-                        st.stop()
-
-                    zip_file.write(output_docx, os.path.basename(output_docx))
-                    zip_file.write(output_pdf, os.path.basename(output_pdf))
-            zip_buffer.seek(0)
-
-        st.success(f"{len(itens_certificado)} relatório(s) gerado(s) com sucesso!")
-
-        st.download_button(
-            label="Baixar Word e PDF",
-            data=zip_buffer.getvalue(),
-            file_name=f"Relatorios_{numero_certificado}.zip",
-            mime="application/zip",
-        )
+    erros = _validar_campos(campos)
+    if erros:
+        with col_form:
+            for e in erros: st.error(e)
+    else:
+        with col_form:
+            with st.spinner("Gerando documento unificado..."):
+                try:
+                    zip_bytes = _gerar_zip(campos)
+                    st.success("Relatório generado com sucesso!")
+                    st.download_button(label="⬇️ Baixar Word e PDF (.zip)", data=zip_bytes, file_name=f"Relatorio_{campos['numero_certificado']}.zip", mime="application/zip")
+                except Exception as e: st.error(format_conversion_error(e))
